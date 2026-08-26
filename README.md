@@ -1,11 +1,15 @@
 <p align="center">
-  <img src="assets/pi-recon-banner.svg" alt="PI Recon - automated reconnaissance for authorized security challenges" width="100%">
+  <img src="assets/pi-recon-banner.svg" alt="PI Recon — lightweight AI red teaming harness for authorized agent challenges" width="100%">
 </p>
 
 <h1 align="center">PI Recon</h1>
 
 <p align="center">
-  面向授权安全挑战环境的自动化侦察与结果验证工具。
+  轻量 harness：在授权 Agent 安全挑战里把「拉题 → 侦察 → 校验 → 摘要」跑成闭环。
+</p>
+
+<p align="center">
+  <em>A thin AI red teaming harness for authorized agent / GenAI security challenges — not a heavy framework.</em>
 </p>
 
 <p align="center">
@@ -14,18 +18,20 @@
   <img alt="Secret-safe builds" src="https://img.shields.io/badge/build-secrets_not_baked-39D98A">
 </p>
 
-PI Recon 把安全挑战中的任务获取、实例调度、代理侦察、候选结果验证和分析沉淀串成一个可持续运行的闭环。它适合需要同时处理多个目标、控制单题时间，并保留可复用调查记录的授权环境。
+PI Recon 源自我们在百度安全挑战赛 / BCTF Agent Plus 攻防赛中的实践。赛程里很清楚的一点是：很多时候，一层足够薄的 harness——调度、超时、提交闸门、把上一轮试过的路径记下来——就能拿到不错的成绩；堆得很重的框架，在真正解题时未必有对应增益。
 
-## 为什么使用 PI Recon
+所以这个仓库刻意保持简单。它更像一套可自托管的 **AI red teaming tools** 雏形：把授权挑战里重复出现的几步串起来（取任务、起实例、有界跑 agent 侦察、校验候选结果、留下摘要），方便改 prompt、改并发、看日志。不是完整平台，也不是通用扫描器。
+
+## 它做了什么
 
 | 能力 | 作用 |
 |------|------|
-| 持续填槽调度 | 自动补充空闲并发槽，避免队列尾部任务长期得不到执行 |
-| 有界执行 | 为每个任务设置硬超时，并在结束后释放平台资源 |
-| 多阶段侦察 | 在同一任务内续接上下文，减少重复探测 |
-| 结果闸门 | 对候选结果进行格式校验、去重和连续错误熔断 |
-| 结构化摘要 | 记录技术栈、攻击面、已试路径、近失点和后续建议 |
-| 安全构建 | 日志、会话和密钥不进入 Git，也不会被写入 Docker 镜像 |
+| 持续填槽调度 | 空闲并发槽自动补任务，避免队列尾部长期饿死 |
+| 有界执行 | 单题硬超时，结束后释放平台资源 |
+| 多阶段侦察 | 同题内续接上下文，少做重复探测 |
+| 结果闸门 | 格式校验、去重、连续错误熔断 |
+| 结构化摘要 | 技术栈、攻击面、已试路径、近失点、下一步建议 |
+| 安全构建 | 日志、会话、密钥不进 Git，也不写进 Docker 镜像 |
 
 ## 工作流程
 
