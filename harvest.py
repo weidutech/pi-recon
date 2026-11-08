@@ -13,6 +13,13 @@ Design (intentionally NOT a full blackboard / infinite endgame runner):
 Env (PI_RECON_* preferred):
   PI_RECON_CONCURRENCY, PI_RECON_JOB_TIMEOUT_SEC, PI_RECON_LLM_KEY,
   PI_RECON_LLM_BASE, PI_RECON_LLM_PROVIDER, PI_RECON_LLM_MODEL, PI_RECON_JOBS_DIR
+
+OrcaRouter Cyber Inference provider:
+  PI_RECON_LLM_PROVIDER=orcarouter      named provider, base https://api.orcarouter.ai/v1
+  PI_RECON_ORCA_AUTH=api_key|pkce       PI_RECON_LLM_KEY (sk-orca-…) or "Connect with OrcaRouter"
+  PI_RECON_ORCA_SCOPE=loopback|oob|auto PKCE delivery for the browser login
+  PI_RECON_ORCA_KEEP=1                  exit when a segment returns 401 (key revoked/needs reauth)
+  --connect-orcarouter / --orcarouter-catalog   inspect the two auth choices and model catalog
 """
 
 from __future__ import annotations
@@ -30,6 +37,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional, Set, Tuple
 
+import net_llm
 from agent_exec import extract_flag_candidates, run_pi_session, utc_now
 from loot_gate import (
     circuit_open,
@@ -107,15 +115,21 @@ def load_dotenv(path: Path) -> None:
             os.environ[k] = v
 
 
-def resolve_llm_key() -> str:
+def resolve_llm_key(provider: str = "") -> str:
     # Prefer the project-specific key name, with generic aliases for portability.
-    for name in (
-        "PI_RECON_LLM_KEY",
-        "PI_RECON_API_KEY",
-        "DEEPSEEK_API_KEY",
-        "API_KEY",
-        "LLM_API_KEY",
-    ):
+    # A named provider never falls back to another provider's key: sending a DeepSeek
+    # key to the OrcaRouter relay would hand one vendor's credential to another.
+    if net_llm.is_orcarouter(provider):
+        names = ("PI_RECON_LLM_KEY", "PI_RECON_API_KEY", net_llm.ORCAROUTER_ENV_KEY)
+    else:
+        names = (
+            "PI_RECON_LLM_KEY",
+            "PI_RECON_API_KEY",
+            "DEEPSEEK_API_KEY",
+            "API_KEY",
+            "LLM_API_KEY",
+        )
+    for name in names:
         v = (os.environ.get(name) or "").strip()
         if v:
             return v
@@ -554,6 +568,10 @@ def run_job(
             hcache[code] = (m.group(1).strip() if m else platform_hint.strip()) or None
             platform_hint = hcache.get(code) or ""
 
+    selected_model = model
+    keep_on_auth_error = (os.environ.get("PI_RECON_ORCA_KEEP") or "").strip().lower() in {"1", "true", "yes"} and (
+        str(provider or "").strip().lower() == "orcarouter"
+    )
     for i, seg_to in enumerate(seg_budgets, start=1):
         left = timeout_sec - (time.monotonic() - t0)
         if left < 45:
@@ -584,7 +602,8 @@ def run_job(
                 user_prompt=prompt,
                 log_path=seg_log,
                 provider=provider or None,
-                model=model or None,
+                model=selected_model,
+                keep_on_auth_error=keep_on_auth_error,
                 api_key=api_key or None,
                 thinking=thinking,
                 pi_bin=pi_bin,
@@ -614,6 +633,13 @@ def run_job(
                 f.write(chunk)
         except OSError:
             pass
+
+        if keep_on_auth_error and exit_code == 2:
+            # OrcaRouter answered 401: the key was revoked. Stop instead of burning the queue.
+            log(f"[job] {code} OrcaRouter auth error — key revoked/needs reauth, leaving job open")
+            if close_after:
+                close_challenge(code)
+            return JobOutcome(code, "auth_error", message="orcarouter 401", target=target, difficulty=difficulty)
 
         if exit_code == 124:
             timed_out = True
@@ -771,6 +797,96 @@ def filter_challenges(
     return out
 
 
+def _build_parser(
+    default_conc, default_to, default_jobs, default_segs, provider, model
+) -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="PI Recon challenge reconnaissance runner")
+    p.add_argument("--concurrency", type=int, default=default_conc, help="parallel jobs (default 3; platform often caps active at 3)")
+    p.add_argument("--job-timeout", type=int, default=default_to, help="per-challenge seconds (default 1200 = 20min)")
+    p.add_argument("--segments", type=int, default=default_segs, help="context segments per job")
+    p.add_argument("--hint-after-fail", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--second-wave", action=argparse.BooleanOptionalAction, default=True)
+    # --endgame / --no-endgame are distinct flags (both may be passed by entrypoint.sh).
+    p.add_argument("--endgame", action="store_true", default=None, help="keep re-running non-scored challenges (default on)")
+    p.add_argument("--no-endgame", action="store_true", help="disable endgame loops (first-touch only)")
+    p.add_argument("--endgame-max-rounds", type=int, default=0)
+    p.add_argument("--campaign-timeout", type=int, default=0)
+    p.add_argument("--provider", default=provider)
+    p.add_argument("--model", default=model, help="model id; OrcaRouter uses --orcarouter-model")
+    p.add_argument(
+        "--orcarouter-model",
+        default=None,
+        help="OrcaRouter model id (default orcarouter/auto; cyber: orca/orcacyber-ultra-1.0, orca/orcacyber-zero-1.5)",
+    )
+    p.add_argument("--api-key", default=None)
+    p.add_argument("--thinking", default=os.environ.get("PI_RECON_THINKING") or os.environ.get("THINKING") or None)
+    p.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "pi"))
+    p.add_argument("--only", default=os.environ.get("PI_RECON_ONLY") or os.environ.get("ONLY") or None)
+    p.add_argument(
+        "--orca-auth",
+        choices=["api_key", "pkce"],
+        default=os.environ.get("PI_RECON_ORCA_AUTH") or "api_key",
+        help="OrcaRouter auth choice: paste an sk-orca- key (api_key) or Connect with OrcaRouter (pkce)",
+    )
+    p.add_argument("--no-prompt", action="store_true", help="never prompt for an OrcaRouter key (fail instead)")
+    p.add_argument(
+        "--connect-orcarouter",
+        action="store_true",
+        help="connect only (API key or PKCE), persist the key, exit",
+    )
+    p.add_argument(
+        "--orcarouter-catalog",
+        action="store_true",
+        help="connect, discover the live OrcaRouter catalog, write models.json and exit",
+    )
+    p.add_argument("--jobs-dir", default=default_jobs)
+    p.add_argument("--system-prompt", default=None)
+    p.add_argument("--no-close", action="store_true")
+    p.add_argument("--include-completed", action="store_true")
+    # Generic aliases keep the CLI convenient across local and container runs.
+    p.add_argument("--max-parallel", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--wall-clock", type=int, default=None, help=argparse.SUPPRESS)
+    p.add_argument("--work-dir", default=None, help=argparse.SUPPRESS)
+    return p
+
+
+def run_orcarouter_connect(args: argparse.Namespace) -> int:
+    """``--connect-orcarouter`` / ``--orcarouter-catalog``: both auth choices, no platform needed."""
+    import orca_auth
+    import orca_models
+
+    log("[orca] OrcaRouter Cyber Inference - two ways to connect:")
+    log(f"[orca]   1) API key : set PI_RECON_LLM_KEY=sk-orca-… (created at {net_llm.ORCAROUTER_KEY_HOME})")
+    log("[orca]   2) Login   : --orca-auth pkce (OAuth 2.0 + PKCE, browser or out-of-band code)")
+    if not net_llm.is_orcarouter(args.provider):
+        log("[orca] installing the named provider entry in models.json")
+    path = net_llm.orcarouter_models_path()
+    api_key = (args.api_key or resolve_llm_key(args.provider)).strip()
+    try:
+        _, model = net_llm.setup_orcarouter(
+            model=args.orcarouter_model,
+            api_key=api_key or None,
+            auth=args.orca_auth,
+            prompt_key=not args.no_prompt,
+            diagnose=False,
+        )
+    except Exception as e:  # noqa: BLE001
+        log(f"[orca] connect failed: {getattr(e, 'code', '')} {e}")
+        return 3
+    entry = orca_auth.CredentialStore(path).read()
+    cred = orca_auth.CredentialStore(path).load()
+    key = cred.key if cred is not None else ""
+    models = [m.get("id") for m in entry.get("models") or []]
+    log(f"[orca] connected with {entry.get('orcaAuth', {}).get('source')}; {len(models)} textual models listed")
+    if args.orcarouter_catalog:
+        origins = orca_auth.Origins.from_env()
+        catalog = orca_models.discover_catalog(origins.api_url, key)
+        for m in catalog.models:
+            log(f"[orca]   {m['id']}  context={m.get('contextWindow', '?')} reasoning={m.get('reasoning')}")
+        log(f"[orca] catalog source={catalog.source} models={len(catalog.models)} default={model}")
+    return 0
+
+
 def main(argv: Optional[List[str]] = None) -> int:
     _configure_live_stdout()
     load_dotenv(ROOT / ".env")
@@ -790,89 +906,20 @@ def main(argv: Optional[List[str]] = None) -> int:
         or os.environ.get("MODEL")
         or "deepseek-v4-flash"
     )
+    if net_llm.is_orcarouter(provider) and not os.environ.get("PI_RECON_LLM_MODEL") and not os.environ.get("MODEL"):
+        model = net_llm.route_model_default(provider)  # orcarouter/auto
 
-    p = argparse.ArgumentParser(description="PI Recon challenge reconnaissance runner")
-    p.add_argument(
-        "--concurrency",
-        type=int,
-        default=default_conc,
-        help="parallel jobs (default 3; platform often caps active at 3)",
-    )
-    p.add_argument(
-        "--job-timeout",
-        type=int,
-        default=default_to,
-        help="per-challenge seconds (default 1200 = 20min)",
-    )
-    p.add_argument(
-        "--segments",
-        type=int,
-        default=default_segs,
-        help="pi sessions per job for context handoff (default 2; 1=single)",
-    )
-    p.add_argument(
-        "--hint-after-fail",
-        action="store_true",
-        default=None,
-        help="after a failed segment, fetch platform hint for next segment (default on)",
-    )
-    p.add_argument(
-        "--no-hint-after-fail",
-        action="store_true",
-        help="disable platform hint fetch",
-    )
-    p.add_argument(
-        "--second-wave",
-        action="store_true",
-        default=None,
-        help="legacy: one retry pass only (prefer --endgame; ignored when endgame on)",
-    )
-    p.add_argument(
-        "--no-second-wave",
-        action="store_true",
-        help="disable the single second-wave when endgame is off",
-    )
-    p.add_argument(
-        "--endgame",
-        action="store_true",
-        default=None,
-        help="after first-touch, keep re-running non-scored until scored or limit (default on)",
-    )
-    p.add_argument(
-        "--no-endgame",
-        action="store_true",
-        help="disable endgame loops (first-touch only, or one second-wave if enabled)",
-    )
-    p.add_argument(
-        "--endgame-max-rounds",
-        type=int,
-        default=None,
-        help="endgame re-queue rounds after first-pass (0=unlimited, default 0). Env PI_RECON_ENDGAME_MAX_ROUNDS",
-    )
-    p.add_argument(
-        "--campaign-timeout",
-        type=int,
-        default=None,
-        help="whole harvest wall seconds from boot (0=no self-exit; default 0, let platform kill). Env PI_RECON_CAMPAIGN_TIMEOUT_SEC",
-    )
-    p.add_argument("--provider", default=provider)
-    p.add_argument("--model", default=model)
-    p.add_argument("--api-key", default=None)
-    p.add_argument("--thinking", default=os.environ.get("PI_RECON_THINKING") or os.environ.get("THINKING") or None)
-    p.add_argument("--pi-bin", default=os.environ.get("PI_BIN", "pi"))
-    p.add_argument("--only", default=os.environ.get("PI_RECON_ONLY") or os.environ.get("ONLY") or None)
-    p.add_argument("--jobs-dir", default=default_jobs)
-    p.add_argument("--system-prompt", default=None)
-    p.add_argument("--no-close", action="store_true")
-    p.add_argument("--include-completed", action="store_true")
-    # Generic aliases keep the CLI convenient across local and container runs.
-    p.add_argument("--max-parallel", type=int, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--wall-clock", type=int, default=None, help=argparse.SUPPRESS)
-    p.add_argument("--work-dir", default=None, help=argparse.SUPPRESS)
-    args = p.parse_args(argv)
+    parser = _build_parser(default_conc, default_to, default_jobs, default_segs, provider, model)
+    args = parser.parse_args(argv)
 
-    if args.max_parallel is not None:
-        args.concurrency = args.max_parallel
+    # --connect-orcarouter / --orcarouter-catalog imply the named provider.
+    orca_mode = bool(getattr(args, "connect_orcarouter", False) or getattr(args, "orcarouter_catalog", False))
+    if orca_mode or net_llm.is_orcarouter(args.provider):
+        args.provider = net_llm.ORCAROUTER_PROVIDER
+        if args.model == "deepseek-v4-flash":
+            args.model = net_llm.route_model_default(args.provider)  # orcarouter/auto
+    if orca_mode:
+        return run_orcarouter_connect(args)
     if args.wall_clock is not None:
         args.job_timeout = args.wall_clock
     if args.work_dir is not None:
@@ -886,7 +933,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return raw not in {"0", "false", "no", "off"}
 
     hint_after_fail = True
-    if args.no_hint_after_fail:
+    if getattr(args, "no_hint_after_fail", False):
         hint_after_fail = False
     elif args.hint_after_fail:
         hint_after_fail = True
@@ -894,7 +941,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         hint_after_fail = _env_bool("PI_RECON_HINT_AFTER_FAIL", True)
 
     second_wave = True
-    if args.no_second_wave:
+    if getattr(args, "no_second_wave", False):
         second_wave = False
     elif args.second_wave:
         second_wave = True
@@ -904,7 +951,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Endgame default ON: keep grinding non-scored until all scored or platform kills us.
     # (Previously only one second-wave then process exit — wasted remaining contest time.)
     endgame = True
-    if args.no_endgame:
+    if getattr(args, "no_endgame", False):
         endgame = False
     elif args.endgame:
         endgame = True
@@ -921,8 +968,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     else:
         campaign_timeout = max(0, env_int("PI_RECON_CAMPAIGN_TIMEOUT_SEC", default=0))
 
-    api_key = (args.api_key or resolve_llm_key()).strip()
-    if not api_key:
+    api_key = (args.api_key or resolve_llm_key(args.provider)).strip()
+    if net_llm.is_orcarouter(args.provider):
+        # OrcaRouter: credential seam (API key or PKCE) -> live catalog -> models.json -> ping.
+        # The recon key stays separate from the main scoring agent key (PI_RECON_LLM_KEY).
+        try:
+            api_key, args.model = net_llm.setup_orcarouter(
+                model=args.orcarouter_model,
+                api_key=api_key or None,
+                auth=args.orca_auth,
+                prompt_key=not args.no_prompt,
+            )
+        except Exception as e:  # noqa: BLE001
+            log(f"[fatal] OrcaRouter connect failed: {getattr(e, 'code', '')} {e}")
+            return 3
+    elif not api_key:
         log("[fatal] set PI_RECON_LLM_KEY (dedicated recon key recommended)")
         return 3
 

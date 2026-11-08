@@ -76,6 +76,9 @@ platform_io.py             挑战平台 API 适配
 agent_exec.py              侦察会话执行与事件记录
 loot_gate.py               候选结果校验与提交控制
 net_llm.py                 LLM 路由与连通性检测
+orca_auth.py               OrcaRouter 凭据入口（API Key / OAuth 2.0 + PKCE）
+orca_models.py             OrcaRouter 模型目录（实时 /v1/models + 已验证 seed）
+tests/                     无网络的单元测试（本地 fake OpenAI 网关）
 prompts/                   侦察提示词与方法规范
 docker/                    容器构建与启动配置
 scripts/watch_run_logs.py  运行状态查看工具
@@ -102,8 +105,8 @@ docker run --rm --env-file .env pi-recon:tsec
 | `BENCHMARK_TOKEN` | 无 | 挑战平台访问令牌 |
 | `PI_RECON_LLM_KEY` | 无 | LLM API key |
 | `PI_RECON_LLM_BASE` | `https://api.deepseek.com/v1` | OpenAI 兼容 API 地址 |
-| `PI_RECON_LLM_PROVIDER` | `deepseek` | Provider 名称 |
-| `PI_RECON_LLM_MODEL` | `deepseek-v4-flash` | 模型名称 |
+| `PI_RECON_LLM_PROVIDER` | `deepseek` | Provider 名称（可选 `orcarouter`，见下文） |
+| `PI_RECON_LLM_MODEL` | `deepseek-v4-flash`（provider 为 `orcarouter` 时为 `orcarouter/auto`） | 模型名称 |
 | `PI_RECON_CONCURRENCY` | `3` | 并行任务数 |
 | `PI_RECON_JOB_TIMEOUT_SEC` | `1200` | 单任务超时秒数 |
 | `PI_RECON_SEGMENTS` | `2` | 每个任务的会话阶段数 |
@@ -113,6 +116,41 @@ docker run --rm --env-file .env pi-recon:tsec
 | `PI_RECON_SUBMIT_MAX_WRONG` | `3` | 连续错误提交熔断阈值 |
 
 提示接口可能影响挑战得分；不需要时请设置 `PI_RECON_HINT_AFTER_FAIL=0`。
+
+### OrcaRouter Cyber Inference
+
+[OrcaRouter](https://www.orcarouter.ai) Cyber Inference 是面向网络安全红蓝队的命名推理 provider：
+为**通过业务验证的安全团队**放行**授权的、scoped** 安全推理请求（红队侦察、授权攻防挑战），基础地址始终为
+`https://api.orcarouter.ai/v1`（OpenAI 兼容）。provider 页 https://www.orcarouter.ai/cyber ，
+cyber 层模型目录 https://www.orcarouter.ai/models?tier=cyber 。
+
+```bash
+export PI_RECON_LLM_PROVIDER=orcarouter
+unset PI_RECON_LLM_BASE PI_RECON_LLM_MODEL      # preset base + catalog default
+python3 harvest.py --connect-orcarouter          # 两种接入方式任选其一
+python3 harvest.py                                # 正常跑任务队列
+```
+
+两种接入方式并列可用，最终都会拿到同一把归用户所有的普通 `sk-orca-…` key：
+
+| 方式 | 命令 / 配置 | 说明 |
+|------|-------------|------|
+| API Key | `PI_RECON_LLM_KEY=sk-orca-…` 或交互输入 | 已在 [console](https://www.orcarouter.ai/console/keys) 建好 key 的用户 |
+| Connect with OrcaRouter | `python3 harvest.py --orca-auth pkce --connect-orcarouter`（`PI_RECON_ORCA_AUTH=pkce`） | OAuth 2.0 + PKCE（S256，无 client secret）；本地有浏览器走 loopback redirect，容器/SSH 用 `PI_RECON_ORCA_SCOPE=oob` 粘贴授权码 |
+
+- 认证在 `https://www.orcarouter.ai`（`/auth`、`/api/v1/auth/keys`），推理与模型目录在 `https://api.orcarouter.ai/v1`。
+  自托管可用 `ORCA_BASE_URL`，或分别覆盖 `ORCA_AUTH_BASE_URL` / `ORCA_API_BASE_URL`。
+- key 存在本项目已有的 `models.json`（`providers.orcarouter.apiKey`），日志只打印掩码形式。
+- PKCE 换回的是持久 key，不是 refresh token：relay 返回 401 时只把发出该请求的那一代凭据标记为
+  `needs_reauth`，重新执行一次 Connect 即可，不会伪造 refresh 或每次启动重新授权。
+- 模型列表来自 `GET /v1/models`（Bearer），实时目录优先；目录不可用时回退到已验证 seed
+  （`orcarouter/auto`、`orcacyber-ultra-1.0`、`orcacyber-zero-1.5`、`orcarouter/fusion`）。
+- 选择模型：`--orcarouter-model <id>` 或 `PI_RECON_LLM_MODEL`（裸写 `orcacyber-*` 会自动映射到 `orca/` 命名空间）；
+  旧式 `--model` 在 OrcaRouter 下不会被当作模型 id，避免把 DeepSeek 默认值传给 relay。
+- 模型推荐：默认 `orcarouter/auto`；安全团队可用 **OrcaCyber Ultra**（`orcacyber-ultra-1.0`）/ **OrcaCyber Zero**
+  （`orcacyber-zero-1.5`）；通用兜底 `orcarouter/fusion`。`python3 harvest.py --orcarouter-catalog` 打印真实可调用列表。
+
+> 仅用于你拥有明确授权的目标；OrcaRouter 只负责把请求送到模型，授权边界仍由你负责。
 
 ## 安全边界
 
