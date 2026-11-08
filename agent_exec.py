@@ -283,6 +283,7 @@ def run_pi_session(
     tee_console: bool = True,
     extra_args: Optional[List[str]] = None,
     job_tag: str = "",
+    keep_on_auth_error: bool = False,
 ) -> int:
     work_dir.mkdir(parents=True, exist_ok=True)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -333,6 +334,10 @@ def run_pi_session(
         meta_cmd[-1] = f"<user_prompt {len(user_prompt)} chars>"
 
     env = os.environ.copy()
+    if provider.strip().lower() == "orcarouter":
+        # pi reads the key from models.json; keep other vendors' credential names out of its env.
+        for foreign in ("DEEPSEEK" + "_API_KEY", "OPENAI" + "_API_KEY", "ANTHROPIC" + "_API_KEY"):
+            env.pop(foreign, None)
     env.setdefault("NO_PROXY", "*")
     env.setdefault("no_proxy", "*")
     env.setdefault("PYTHONUNBUFFERED", "1")
@@ -425,6 +430,8 @@ def run_pi_session(
                     tag=tag,
                 )
             reader.join(timeout=5)
+            if exit_code == 0 and keep_on_auth_error and auth_error_seen(log_path):
+                exit_code = 2  # surfaced as JobOutcome("auth_error")
         except FileNotFoundError as e:
             _write(lock, logf, f"# --- failed to spawn pi: {e} ---", tee_console, tag=tag)
             exit_code = 127
@@ -472,6 +479,21 @@ def run_pi_session(
         encoding="utf-8",
     )
     return exit_code
+
+
+_AUTH_ERROR_RE = re.compile(
+    r"(invalid[ _-]?api[ _-]?key|incorrect api key|401 unauthorized|unauthorized \(401|\b401\b[^\n]{0,40}api key)",
+    re.IGNORECASE,
+)
+
+
+def auth_error_seen(log_path: Path) -> bool:
+    """True when the piped agent log shows the relay rejected the credential."""
+    try:
+        text = log_path.read_text(encoding="utf-8", errors="replace")[-65536:]
+    except OSError:
+        return False
+    return bool(_AUTH_ERROR_RE.search(text))
 
 
 def extract_flag_candidates(work_dir: Path, log_path: Path) -> List[str]:

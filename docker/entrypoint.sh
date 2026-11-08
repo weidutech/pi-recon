@@ -37,9 +37,21 @@ fi
 export PI_RECON_LLM_KEY="$KEY"
 export DEEPSEEK_API_KEY="$KEY"
 export API_KEY="$KEY"
+# OrcaRouter runs must not carry another provider's key in its legacy aliases:
+# the credential seam only reads PI_RECON_LLM_KEY / PI_RECON_ORCA_KEY.
+if [[ "${PI_RECON_LLM_PROVIDER:-${PROVIDER:-deepseek}}" == orcarouter* ]]; then
+  unset DEEPSEEK_API_KEY API_KEY LLM_API_KEY PI_RECON_API_KEY
+fi
 
 PROVIDER="${PI_RECON_LLM_PROVIDER:-${PROVIDER:-deepseek}}"
-MODEL="${PI_RECON_LLM_MODEL:-${MODEL:-deepseek-v4-flash}}"
+MODEL="${PI_RECON_LLM_MODEL:-${MODEL:-}}"
+if [[ -z "$MODEL" ]]; then
+  # OrcaRouter defaults to the provider's auto model; others keep the historical default.
+  case "$PROVIDER" in
+    orcarouter*) MODEL="orcarouter/auto" ;;
+    *) MODEL="deepseek-v4-flash" ;;
+  esac
+fi
 BASE_HINT="${PI_RECON_LLM_BASE:-${DEEPSEEK_BASE_URL:-}}"
 export PROVIDER MODEL
 if [[ -n "$BASE_HINT" ]]; then
@@ -74,6 +86,23 @@ fi
 echo "[pi-recon] llm probe..."
 python3 /app/net_llm.py || true
 
+# OrcaRouter: credential seam (API key or PKCE) + live /v1/models -> models.json.
+# The entrypoint already exports PI_RECON_LLM_KEY, which is the API-key adapter's input.
+# --orcarouter-model drives both the connect step and the harvest run below.
+ORCA_MODEL_ARGS=()
+if [[ "$PROVIDER" == orcarouter* ]]; then
+  echo "[pi-recon] orcarouter auth=${PI_RECON_ORCA_AUTH:-api_key} scope=${PI_RECON_ORCA_SCOPE:-auto} model=${MODEL}"
+  ORCA_CONNECT_ARGS=(--provider orcarouter --orcarouter-catalog --no-prompt --orcarouter-model "${MODEL}")
+  if [[ -n "${PI_RECON_ORCA_AUTH:-}" ]]; then
+    ORCA_CONNECT_ARGS+=(--orca-auth "${PI_RECON_ORCA_AUTH}")
+  fi
+  ORCA_MODEL_ARGS=(--orcarouter-model "${MODEL}")
+  if ! python3 /app/harvest.py "${ORCA_CONNECT_ARGS[@]}"; then
+    echo "[pi-recon] ERROR: OrcaRouter connect failed - exiting so the orchestrator can restart with a fresh credential" >&2
+    exit 3
+  fi
+fi
+
 # Platform max active instances is typically 3
 CONC="${PI_RECON_CONCURRENCY:-${MAX_PARALLEL:-3}}"
 TO="${PI_RECON_JOB_TIMEOUT_SEC:-${WALL_CLOCK:-1200}}"
@@ -94,6 +123,7 @@ ARGS=(
   --api-key "${KEY}"
   --jobs-dir "${JOBS}"
 )
+ARGS+=("${ORCA_MODEL_ARGS[@]+"${ORCA_MODEL_ARGS[@]}"}")
 # explicit flags from env (0 disables)
 if [[ "${PI_RECON_HINT_AFTER_FAIL:-1}" == "0" ]]; then
   ARGS+=(--no-hint-after-fail)
